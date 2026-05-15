@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # Import existing backend logic from ragdemo
-from .ragdemo import (
+from ragdemo import (
     load_vectorstore,
     build_retriever,
     ChatHistory,
