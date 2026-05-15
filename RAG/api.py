@@ -69,17 +69,28 @@ async def delete_history():
 
 @app.post("/api/chat")
 async def chat(request: Request, req: ChatRequest):
+    global retriever
+
     async def event_generator():
-        global retriever
         if not retriever:
-            yield f"data: {json.dumps({'error': 'Vector store not initialized. Please load a document source first.'})}\n\n"
+            yield f"data: {json.dumps({'error': 'Vector store not initialized.'})}\n\n"
             return
-            
+
         try:
-            llm = ChatOpenAI(model=CONFIG["model"], temperature=CONFIG["temperature"], streaming=True)
-            rewritten = rewrite_query(req.message, llm)
-            retrieved_docs = retriever.invoke(rewritten)
-            
+            llm = ChatOpenAI(
+                model=CONFIG["model"],
+                temperature=CONFIG["temperature"],
+                streaming=True,
+            )
+
+            # FIX: run blocking rewrite_query in a thread so it doesn't block the loop
+            rewritten = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: rewrite_query(req.message, llm)
+            )
+            retrieved_docs = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: retriever.invoke(rewritten)
+            )
+
             context_parts, source_labels = [], []
             seen_labels = set()
             for i, doc in enumerate(retrieved_docs):
@@ -88,36 +99,34 @@ async def chat(request: Request, req: ChatRequest):
                 source_labels.append(f"[{i+1}] {label}")
                 if label not in seen_labels:
                     seen_labels.add(label)
-                    # Send source back to UI first
                     yield f"data: {json.dumps({'source': label})}\n\n"
 
             context_text = "\n\n".join(context_parts)
             sources_text = "\n".join(source_labels)
-            
             input_tokens = _estimate_tokens(context_text + sources_text + req.message)
-            
+
             final_prompt = RAG_PROMPT.invoke({
                 "context":  context_text,
                 "sources":  sources_text,
                 "history":  history.langchain_messages(CONFIG["memory_turns"]),
                 "question": req.message,
             })
-            
+
             full_response = ""
-            for chunk in llm.stream(final_prompt):
+            # FIX: use astream() instead of stream()
+            async for chunk in llm.astream(final_prompt):
                 if await request.is_disconnected():
                     break
                 full_response += chunk.content
                 yield f"data: {json.dumps({'chunk': chunk.content})}\n\n"
-            
+
             tracker.add(input_tokens, _estimate_tokens(full_response))
             history.add("human", req.message)
             history.add("assistant", full_response)
-            
-            # Send latest cost details
+
             yield f"data: {json.dumps({'cost_queries': tracker.total_queries, 'cost_usd': round(tracker.cost_usd, 5)})}\n\n"
             yield "data: [DONE]\n\n"
-            
+
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 

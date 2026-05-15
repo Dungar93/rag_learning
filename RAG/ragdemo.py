@@ -163,7 +163,12 @@ def detect_and_load(source: str) -> List[Document]:
         docs: List[Document] = []
         for glob_pattern, loader_cls in loaders.items():
             try:
-                loader = DirectoryLoader(source, glob=glob_pattern, loader_cls=loader_cls, silent_errors=True)
+                loader = DirectoryLoader(
+                    source,
+                    glob=glob_pattern,
+                    loader_cls=loader_cls,
+                    silent_errors=True,
+                )
                 docs.extend(loader.load())
             except Exception:
                 pass
@@ -191,8 +196,8 @@ def detect_and_load(source: str) -> List[Document]:
 
 def chunk_documents(documents: List[Document]) -> List[Document]:
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size    = CONFIG["chunk_size"],
-        chunk_overlap = CONFIG["chunk_overlap"],
+        chunk_size      = CONFIG["chunk_size"],
+        chunk_overlap   = CONFIG["chunk_overlap"],
         add_start_index = True,           # metadata: start char position
     )
     chunks = splitter.split_documents(documents)
@@ -200,8 +205,10 @@ def chunk_documents(documents: List[Document]) -> List[Document]:
     # Attach a short readable source label to every chunk
     for i, chunk in enumerate(chunks):
         src = chunk.metadata.get("source", "unknown")
-        chunk.metadata["chunk_id"] = i
-        chunk.metadata["source_label"] = Path(src).name if "/" in src or "\\" in src else src
+        chunk.metadata["chunk_id"]     = i
+        chunk.metadata["source_label"] = (
+            Path(src).name if ("/" in src or "\\" in src) else src
+        )
 
     return chunks
 
@@ -212,13 +219,20 @@ def chunk_documents(documents: List[Document]) -> List[Document]:
 
 def build_vectorstore(chunks: List[Document]) -> Chroma:
     info("Creating embeddings and building Chroma vector store …")
-    embeddings = OpenAIEmbeddings()
+    embeddings  = OpenAIEmbeddings()
     vectorstore = Chroma.from_documents(
-        documents     = chunks,
-        embedding     = embeddings,
+        documents         = chunks,
+        embedding         = embeddings,
         persist_directory = CONFIG["persist_dir"],
     )
-    vectorstore.persist()
+    # FIX: persist() is deprecated in newer langchain-chroma versions.
+    # Chroma auto-persists when persist_directory is provided.
+    # Only call persist() if the method exists to stay backwards-compatible.
+    if hasattr(vectorstore, "persist"):
+        try:
+            vectorstore.persist()
+        except Exception:
+            pass   # silently skip if the version no longer supports it
     return vectorstore
 
 
@@ -229,7 +243,7 @@ def load_vectorstore() -> Optional[Chroma]:
         info("Loading existing Chroma vector store …")
         embeddings = OpenAIEmbeddings()
         return Chroma(
-            persist_directory = persist_dir,
+            persist_directory  = persist_dir,
             embedding_function = embeddings,
         )
     return None
@@ -319,7 +333,7 @@ class ChatHistory:
 
     def langchain_messages(self, last_n: int):
         """Return last_n turns as LangChain message objects."""
-        recent = self.messages[-(last_n * 2):]      # 2 messages per turn
+        recent  = self.messages[-(last_n * 2):]      # 2 messages per turn
         lc_msgs = []
         for m in recent:
             if m["role"] == "human":
@@ -473,7 +487,7 @@ def rag_query(
 
     banner("RETRIEVED CHUNKS", C.BLUE)
     for i, doc in enumerate(retrieved_docs):
-        label   = doc.metadata.get("source_label", f"chunk_{i}")
+        label    = doc.metadata.get("source_label", f"chunk_{i}")
         chunk_id = doc.metadata.get("chunk_id", i)
         print(f"{C.BOLD}{C.BLUE}── Source [{i+1}] : {label}  (chunk #{chunk_id}){C.RESET}")
         preview = doc.page_content[:250].replace("\n", " ")
@@ -482,12 +496,12 @@ def rag_query(
         source_labels.append(f"[{i+1}] {label}")
 
     context_text = "\n\n".join(context_parts)
-    sources_text  = "\n".join(source_labels)
+    sources_text = "\n".join(source_labels)
 
     # ── 4. Estimate input tokens ──────────────────────
-    history_msgs  = history.langchain_messages(CONFIG["memory_turns"])
-    prompt_text   = context_text + sources_text + question
-    input_tokens  = _estimate_tokens(prompt_text)
+    history_msgs = history.langchain_messages(CONFIG["memory_turns"])
+    prompt_text  = context_text + sources_text + question
+    input_tokens = _estimate_tokens(prompt_text)
 
     # ── 5. Build final prompt ─────────────────────────
     final_prompt = RAG_PROMPT.invoke({
@@ -525,6 +539,417 @@ def rag_query(
 
 
 # =========================================================
+# MODERN RAG PIPELINE
+# =========================================================
+
+
+# ── STAGE 1 : Query Classifier ─────────────────────────
+
+def query_classifier(question: str, llm: ChatOpenAI) -> str:
+    """
+    Classify the incoming user question into a category.
+
+    Suggested categories:
+        - "factual"        → needs document retrieval
+        - "conversational" → chitchat / greeting, skip retrieval
+        - "out_of_scope"   → unrelated to loaded documents
+        - "multi_hop"      → requires linking facts across documents
+
+    Returns:
+        str: One of the category labels above.
+    """
+    prompt = f"""You are a query classifier for a RAG system.
+
+Classify the user query into EXACTLY ONE category:
+
+1. factual        - Questions requiring document retrieval / factual information
+2. conversational - Greetings, casual conversation, small talk
+3. out_of_scope   - Questions unrelated to the document knowledge base
+4. multi_hop      - Questions requiring combining multiple facts / documents
+
+Return ONLY the category name, nothing else.
+
+User Query:
+{question}
+"""
+    response = llm.invoke(prompt)
+    category = response.content.strip().lower()
+
+    allowed_categories = {"factual", "conversational", "out_of_scope", "multi_hop"}
+    if category not in allowed_categories:
+        category = "factual"
+
+    return category
+
+
+# ── STAGE 2 : Multi-Query Expansion ────────────────────
+
+def multi_query_expand(question: str, llm: ChatOpenAI, n: int = 3) -> List[str]:
+    """
+    Expand a single user question into n rephrased sub-queries.
+
+    FIX: previously returned n+1 queries due to inserting the original
+    before slicing with [:n+1].  Now inserts original and slices to exactly
+    n total (original counts as one of the n).
+
+    Returns:
+        List[str]: Exactly n unique queries (original + rephrased variants).
+    """
+    prompt = f"""You are a query expansion system for a RAG application.
+
+Generate {n - 1} different rephrasings of the user's question.
+
+Rules:
+- Preserve the original meaning
+- Use different wording and perspectives
+- Keep each query concise
+- Return ONLY the queries, one per line
+- No numbering, no explanations
+
+User Question:
+{question}
+"""
+    response = llm.invoke(prompt)
+    variants = [q.strip() for q in response.content.strip().split("\n") if q.strip()]
+
+    # Always include the original as the first query
+    all_queries = [question] + variants
+
+    # Deduplicate while preserving order
+    seen: set = set()
+    unique: List[str] = []
+    for q in all_queries:
+        if q not in seen:
+            seen.add(q)
+            unique.append(q)
+
+    # Return exactly n queries
+    return unique[:n]
+
+
+# ── STAGE 3 : Hybrid Retriever ─────────────────────────
+
+def build_hybrid_retriever(vectorstore: Chroma, chunks: List[Document]):
+    """
+    Build a hybrid retriever combining dense (vector) and sparse (BM25) search.
+
+    FIX: vectorstore was previously passed as None from modern_rag_query,
+    causing an AttributeError on .as_retriever().  The caller must now pass
+    the real Chroma instance.
+
+    Returns:
+        EnsembleRetriever: combined BM25 (40%) + dense MMR (60%) retriever.
+    """
+    from langchain_community.retrievers import BM25Retriever
+    from langchain.retrievers import EnsembleRetriever
+
+    # Sparse retriever — keyword based (BM25)
+    bm25_retriever   = BM25Retriever.from_documents(chunks)
+    bm25_retriever.k = CONFIG["retriever_k"]
+
+    # Dense retriever — semantic (Chroma MMR)
+    dense_retriever = vectorstore.as_retriever(
+        search_type   = "mmr",
+        search_kwargs = {
+            "k":       CONFIG["retriever_k"],
+            "fetch_k": CONFIG["retriever_fetch"],
+        },
+    )
+
+    # Ensemble: 40% BM25 weight, 60% dense weight
+    ensemble = EnsembleRetriever(
+        retrievers = [bm25_retriever, dense_retriever],
+        weights    = [0.4, 0.6],
+    )
+    return ensemble
+
+
+# ── STAGE 4 : Reranker ─────────────────────────────────
+
+def rerank_documents(
+    question:  str,
+    documents: List[Document],
+    top_k:     int = 5,
+) -> List[Document]:
+    """
+    Rerank retrieved documents using a cross-encoder model.
+    Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (fast, small, effective).
+
+    Returns:
+        List[Document]: top_k most relevant documents, sorted by score desc.
+    """
+    if not documents:
+        return []
+
+    from sentence_transformers import CrossEncoder
+
+    model  = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    pairs  = [(question, doc.page_content) for doc in documents]
+    scores = model.predict(pairs)
+
+    ranked = sorted(zip(scores, documents), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_k]]
+
+
+# ── STAGE 5 : Context Compression ──────────────────────
+
+def compress_context(
+    question:  str,
+    documents: List[Document],
+    llm:       ChatOpenAI,
+) -> List[Document]:
+    """
+    Compress each retrieved document to retain only the most relevant sentences.
+
+    Uses LLMChainExtractor to extract only the portions relevant to the question.
+    Drops the document entirely if nothing relevant is found.
+
+    Returns:
+        List[Document]: Compressed documents; falls back to originals if all
+                        are filtered out.
+    """
+    from langchain.retrievers.document_compressors import LLMChainExtractor
+
+    compressor      = LLMChainExtractor.from_llm(llm)
+    compressed_docs: List[Document] = []
+
+    for doc in documents:
+        try:
+            result = compressor.compress_documents([doc], question)
+            if result:
+                compressed_docs.extend(result)
+        except Exception:
+            # On failure, keep the original document rather than losing it
+            compressed_docs.append(doc)
+
+    # Fallback: if compression removed everything, return originals
+    return compressed_docs if compressed_docs else documents
+
+
+# ── STAGE 6 : Hallucination Check ──────────────────────
+
+def hallucination_check(
+    question: str,
+    answer:   str,
+    context:  str,
+    llm:      ChatOpenAI,
+) -> Dict:
+    """
+    Verify that the generated answer is grounded in the retrieved context.
+
+    Returns:
+        Dict with keys: grounded (bool), confidence (float),
+                        issues (List[str]), revised_answer (str).
+    """
+    prompt = f"""You are a strict hallucination detector for a RAG system.
+
+Verify whether the ANSWER is fully supported by the CONTEXT.
+
+QUESTION:
+{question}
+
+CONTEXT:
+{context}
+
+ANSWER TO VERIFY:
+{answer}
+
+Instructions:
+1. Identify every factual claim in the ANSWER.
+2. Check if each claim is directly supported by the CONTEXT.
+3. List any claims NOT found in the CONTEXT as issues.
+4. If there are issues, write a revised answer using ONLY the CONTEXT.
+
+Respond with VALID JSON ONLY in this exact format:
+{{
+  "grounded": true or false,
+  "confidence": 0.0 to 1.0,
+  "issues": ["issue 1", "issue 2"],
+  "revised_answer": "corrected answer here, or same as original if grounded"
+}}
+"""
+    try:
+        response = llm.invoke(prompt)
+        raw = response.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+        return {
+            "grounded":       bool(result.get("grounded", True)),
+            "confidence":     float(result.get("confidence", 1.0)),
+            "issues":         result.get("issues", []),
+            "revised_answer": result.get("revised_answer", answer),
+        }
+    except Exception:
+        # If parsing fails, assume grounded to avoid blocking the response
+        return {
+            "grounded":       True,
+            "confidence":     0.5,
+            "issues":         [],
+            "revised_answer": answer,
+        }
+
+
+# ── MODERN PIPELINE ENTRY POINT ────────────────────────
+
+def modern_rag_query(
+    question:    str,
+    retriever,               # base dense retriever — used as fallback
+    chunks:      List[Document],
+    vectorstore: Chroma,     # FIX: added so hybrid retriever can use it
+    llm:         ChatOpenAI,
+    history:     ChatHistory,
+    tracker:     CostTracker,
+) -> str:
+    """
+    Full modern RAG pipeline:
+        1. query_classifier     → skip retrieval for chitchat / out-of-scope
+        2. multi_query_expand   → generate n sub-queries for better recall
+        3. build_hybrid_retriever → BM25 + dense, retrieve per sub-query, dedup
+        4. rerank_documents     → cross-encoder reranking
+        5. compress_context     → trim irrelevant sentences
+        6. LLM Generation       → stream answer via RAG_PROMPT
+        7. hallucination_check  → verify grounding, use revised_answer if needed
+        8. history + tracker    → persist and track cost
+
+    FIX: vectorstore parameter added (was previously hardcoded as None,
+    causing AttributeError inside build_hybrid_retriever).
+
+    Returns:
+        str: The final (hallucination-checked) answer string.
+    """
+
+    # ── Stage 1 : Classify query ──────────────────────
+    info("Classifying query …")
+    category = query_classifier(question, llm)
+    print(f"  {C.GREY}Category: {category}{C.RESET}")
+
+    # Short-circuit: handle non-retrieval queries directly
+    if category == "conversational":
+        response = llm.invoke(question)
+        answer   = response.content.strip()
+        history.add("human", question)
+        history.add("assistant", answer)
+        banner("ANSWER", C.GREEN)
+        print(f"{C.WHITE}{answer}{C.RESET}\n")
+        return answer
+
+    if category == "out_of_scope":
+        answer = (
+            "I'm sorry, your question appears to be outside the scope of the "
+            "loaded documents. Please ask something related to the knowledge base."
+        )
+        history.add("human", question)
+        history.add("assistant", answer)
+        warn(answer)
+        return answer
+
+    # ── Stage 2 : Multi-query expansion ──────────────
+    info("Expanding query into sub-queries …")
+    sub_queries = multi_query_expand(question, llm, n=3)
+    for i, q in enumerate(sub_queries):
+        print(f"  {C.GREY}[{i+1}] {q}{C.RESET}")
+
+    # ── Stage 3 : Hybrid retrieval ────────────────────
+    info("Running hybrid retrieval (BM25 + dense) …")
+    try:
+        # FIX: pass the real vectorstore instead of None
+        hybrid_retriever = build_hybrid_retriever(
+            vectorstore = vectorstore,
+            chunks      = chunks,
+        )
+    except Exception as e:
+        warn(f"Hybrid retriever failed ({e}), falling back to dense retriever.")
+        hybrid_retriever = retriever
+
+    # Retrieve for each sub-query and deduplicate by page_content
+    seen_content: set          = set()
+    all_docs:     List[Document] = []
+
+    for q in sub_queries:
+        try:
+            docs = hybrid_retriever.invoke(q)
+            for doc in docs:
+                if doc.page_content not in seen_content:
+                    seen_content.add(doc.page_content)
+                    all_docs.append(doc)
+        except Exception:
+            pass
+
+    if not all_docs:
+        warn("No documents retrieved — falling back to dense retriever.")
+        all_docs = retriever.invoke(question)
+
+    # ── Stage 4 : Rerank ──────────────────────────────
+    info(f"Reranking {len(all_docs)} candidate documents …")
+    reranked_docs = rerank_documents(question, all_docs, top_k=CONFIG["retriever_k"])
+
+    # ── Stage 5 : Context compression ─────────────────
+    info("Compressing context …")
+    compressed_docs = compress_context(question, reranked_docs, llm)
+
+    # ── Stage 6 : Build context + generate answer ─────
+    context_parts: List[str] = []
+    source_labels: List[str] = []
+
+    banner("RETRIEVED CHUNKS", C.BLUE)
+    for i, doc in enumerate(compressed_docs):
+        label    = doc.metadata.get("source_label", f"chunk_{i}")
+        chunk_id = doc.metadata.get("chunk_id", i)
+        print(f"{C.BOLD}{C.BLUE}── Source [{i+1}] : {label}  (chunk #{chunk_id}){C.RESET}")
+        preview = doc.page_content[:250].replace("\n", " ")
+        print(f"   {C.GREY}{preview}…{C.RESET}\n")
+        context_parts.append(f"[{i+1}] {doc.page_content}")
+        source_labels.append(f"[{i+1}] {label}")
+
+    context_text = "\n\n".join(context_parts)
+    sources_text = "\n".join(source_labels)
+
+    input_tokens = _estimate_tokens(context_text + sources_text + question)
+    history_msgs = history.langchain_messages(CONFIG["memory_turns"])
+
+    final_prompt = RAG_PROMPT.invoke({
+        "context":  context_text,
+        "sources":  sources_text,
+        "history":  history_msgs,
+        "question": question,
+    })
+
+    banner("ANSWER", C.GREEN)
+    answer_chunks: List[str] = []
+    for chunk in llm.stream(final_prompt):
+        token = chunk.content
+        print(f"{C.WHITE}{token}{C.RESET}", end="", flush=True)
+        answer_chunks.append(token)
+    print("\n")
+    raw_answer = "".join(answer_chunks)
+
+    # ── Stage 7 : Hallucination check ─────────────────
+    info("Checking answer for hallucinations …")
+    check = hallucination_check(question, raw_answer, context_text, llm)
+
+    if not check["grounded"]:
+        warn(f"Hallucination detected! Issues: {check['issues']}")
+        final_answer = check["revised_answer"]
+        warn("Answer was revised to remove unsupported claims.")
+        print(f"{C.YELLOW}{final_answer}{C.RESET}\n")
+    else:
+        final_answer = raw_answer
+        success(f"Answer grounded (confidence: {check['confidence']:.0%})")
+
+    # ── Stage 8 : Track cost + persist history ─────────
+    output_tokens = _estimate_tokens(final_answer)
+    tracker.add(input_tokens, output_tokens)
+    history.add("human", question)
+    history.add("assistant", final_answer)
+
+    return final_answer
+
+
+# =========================================================
 # MAIN  — STARTUP & CHAT LOOP
 # =========================================================
 
@@ -552,7 +977,7 @@ def main():
 
     # ── Vector store ──────────────────────────────────
     rebuild_choice = "y"
-    existing = load_vectorstore()
+    existing       = load_vectorstore()
     if existing:
         rebuild_choice = input(
             f"{C.YELLOW}Existing vector store found. Rebuild? [y/N]: {C.RESET}"
@@ -567,7 +992,7 @@ def main():
 
     # ── Retriever & LLM ───────────────────────────────
     retriever = build_retriever(vectorstore)
-    llm       = ChatOpenAI(
+    llm = ChatOpenAI(
         model       = CONFIG["model"],
         temperature = CONFIG["temperature"],
         streaming   = CONFIG["streaming"],
@@ -604,7 +1029,16 @@ def main():
             break
 
         try:
-            rag_query(question, retriever, llm, history, tracker)
+            # FIX: pass vectorstore so modern_rag_query can build the hybrid retriever
+            modern_rag_query(
+                question    = question,
+                retriever   = retriever,
+                chunks      = chunks,
+                vectorstore = vectorstore,
+                llm         = llm,
+                history     = history,
+                tracker     = tracker,
+            )
         except Exception as e:
             error(f"Query failed: {e}")
 

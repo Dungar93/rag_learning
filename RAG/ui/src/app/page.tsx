@@ -2,26 +2,79 @@
 
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
-import { Send, Upload, Trash2, Database, DollarSign, Activity, FileText } from "lucide-react";
+import {
+  Send, Upload, Trash2, Database,
+  DollarSign, Activity, FileText, ChevronRight, Zap
+} from "lucide-react";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+type Message = { role: string; content: string; id: string; sources?: string[] };
+
+// ─── Typing cursor for streaming ─────────────────────────────────────────────
+function TypingCursor() {
+  return (
+    <span
+      className="inline-block w-[2px] h-[1em] bg-amber-400 ml-0.5 align-middle"
+      style={{ animation: "blink 0.9s step-end infinite" }}
+    />
+  );
+}
+
+// ─── Source chip ─────────────────────────────────────────────────────────────
+function SourceChip({ label }: { label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-400/10 border border-amber-400/20 text-amber-400 text-[10px] font-mono tracking-wider mr-1 mb-1">
+      <FileText className="w-2.5 h-2.5 shrink-0" />
+      {label}
+    </span>
+  );
+}
+
+// ─── Animated stat block ──────────────────────────────────────────────────────
+function StatBlock({ icon: Icon, label, value }: { icon: any; label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-1 p-4 rounded-xl bg-[#0a0a0f] border border-white/5">
+      <span className="flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-[0.15em] text-zinc-500">
+        <Icon className="w-2.5 h-2.5" />
+        {label}
+      </span>
+      <span
+        className="text-2xl font-display font-light text-white tabular-nums"
+        style={{ fontFamily: "var(--font-dm-mono)" }}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+// ─── Main Page ────────────────────────────────────────────────────────────────
 export default function Home() {
   const [source, setSource] = useState("");
   const [loading, setLoading] = useState(false);
-  const [messages, setMessages] = useState<{ role: string; content: string; id: string }[]>([]);
+  const [indexSuccess, setIndexSuccess] = useState(false);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [chatting, setChatting] = useState(false);
-  
   const [costQueries, setCostQueries] = useState(0);
   const [costUsd, setCostUsd] = useState(0);
-  
+  const [streamingId, setStreamingId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
+  // ── Load history on mount ──
   useEffect(() => {
     fetch("http://localhost:8000/api/history")
-      .then(res => res.json())
+      .then(r => r.json())
       .then(data => {
         if (data.messages) {
-          setMessages(data.messages.map((m: any, i: number) => ({ role: m.role, content: m.content, id: `hist-${i}` })));
+          setMessages(
+            data.messages.map((m: any, i: number) => ({
+              role: m.role,
+              content: m.content,
+              id: `hist-${i}`,
+            }))
+          );
         }
         setCostQueries(data.cost_queries || 0);
         setCostUsd(data.cost_usd || 0);
@@ -29,88 +82,91 @@ export default function Home() {
       .catch(console.error);
   }, []);
 
-  const scrollToBottom = () => {
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  };
+  }, [messages]);
 
-  useEffect(() => scrollToBottom(), [messages]);
-
+  // ── Build vectorstore ──
   const handleLoadVectorStore = async () => {
     if (!source.trim()) return;
     setLoading(true);
+    setIndexSuccess(false);
     try {
-      const response = await fetch("http://localhost:8000/api/vectorstore/build", {
+      const res = await fetch("http://localhost:8000/api/vectorstore/build", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ source })
+        body: JSON.stringify({ source }),
       });
-      const data = await response.json();
+      const data = await res.json();
       if (data.success) {
-        alert(data.message);
+        setIndexSuccess(true);
+        setTimeout(() => setIndexSuccess(false), 4000);
       } else {
         alert("Error: " + data.error);
       }
-    } catch (e) {
-      alert("Failed to build vector store. Check if API is running.");
-      console.error(e);
+    } catch {
+      alert("Failed to build vector store. Is the API running?");
     }
     setLoading(false);
   };
 
+  // ── Clear history ──
   const handleClearHistory = async () => {
     try {
       await fetch("http://localhost:8000/api/history", { method: "DELETE" });
       setMessages([]);
     } catch (e) {
-      console.error("Failed to clear", e);
+      console.error(e);
     }
   };
 
+  // ── Send message ──
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || chatting) return;
 
     const userMsg = input.trim();
     setInput("");
-    
-    // Add user message to UI immediately
+
     const newMsgId = `human-${Date.now()}`;
     const botMsgId = `bot-${Date.now()}`;
+
     setMessages(prev => [...prev, { role: "human", content: userMsg, id: newMsgId }]);
-    
     setChatting(true);
+    setStreamingId(botMsgId);
 
     try {
       const response = await fetch("http://localhost:8000/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: userMsg })
+        body: JSON.stringify({ message: userMsg }),
       });
 
       if (!response.body) throw new Error("No response body");
-      
+
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      
-      setMessages(prev => [...prev, { role: "assistant", content: "", id: botMsgId }]);
+
+      setMessages(prev => [
+        ...prev,
+        { role: "assistant", content: "", id: botMsgId, sources: [] },
+      ]);
+
       let botContent = "";
-      
-      let done = false;
-      while (!done) {
-        const { value, done: doneReading } = await reader.read();
-        done = doneReading;
+      let collectedSources: string[] = [];
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
         if (!value) continue;
 
-        const chunk = decoder.decode(value, { stream: true });
-        // The SSE backend might send multiple 'data: ...\n\n' chunks in one read
-        const blocks = chunk.split('\n\n');
-        
+        const raw = decoder.decode(value, { stream: true });
+        const blocks = raw.split("\n\n");
+
         for (const block of blocks) {
-          if (!block || !block.startsWith('data: ')) continue;
-          
-          const dataStr = block.replace('data: ', '').trim();
-          if (!dataStr) continue;
-          if (dataStr === '[DONE]') continue;
+          if (!block.startsWith("data: ")) continue;
+          const dataStr = block.replace("data: ", "").trim();
+          if (!dataStr || dataStr === "[DONE]") continue;
 
           try {
             const data = JSON.parse(dataStr);
@@ -119,147 +175,338 @@ export default function Home() {
             } else if (data.chunk) {
               botContent += data.chunk;
             } else if (data.source) {
-              botContent = `_[Source: ${data.source}]_\n\n` + botContent;
+              collectedSources = [...new Set([...collectedSources, data.source])];
             } else if (data.cost_queries !== undefined) {
               setCostQueries(data.cost_queries);
               setCostUsd(data.cost_usd);
             }
-            
-            // Re-render
-            setMessages(prev => prev.map(m => m.id === botMsgId ? { ...m, content: botContent } : m));
-          } catch (err) {
-             console.error("Parse error:", dataStr, err);
+
+            setMessages(prev =>
+              prev.map(m =>
+                m.id === botMsgId
+                  ? { ...m, content: botContent, sources: collectedSources }
+                  : m
+              )
+            );
+          } catch {
+            // ignore parse errors
           }
         }
       }
-    } catch (err) {
-      console.error(err);
-      setMessages(prev => [...prev, { role: "assistant", content: "**Error generating response.** Make sure API is running.", id: botMsgId }]);
+    } catch {
+      setMessages(prev => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "**Error generating response.** Make sure the API is running.",
+          id: botMsgId,
+        },
+      ]);
     } finally {
       setChatting(false);
+      setStreamingId(null);
+      inputRef.current?.focus();
     }
   };
 
+  // ─────────────────────────────────────────────────────────────────────────────
   return (
-    <div className="flex h-screen bg-gray-950 text-gray-100 font-sans">
-      {/* Sidebar Focus Area */}
-      <div className="w-80 bg-gray-900 border-r border-gray-800 p-6 flex flex-col z-20 shadow-2xl">
-        <div className="flex items-center gap-3 mb-8">
-          <div className="p-2.5 bg-blue-600 rounded-xl shadow-lg shadow-blue-500/20">
-            <Database className="w-5 h-5 text-white" />
-          </div>
-          <h1 className="text-xl font-bold tracking-tight text-white">RAG Engine</h1>
-        </div>
+    <>
+      {/* Global styles */}
+      <style>{`
+        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+        @keyframes fadeSlideUp {
+          from { opacity:0; transform:translateY(12px) }
+          to   { opacity:1; transform:translateY(0) }
+        }
+        @keyframes shimmer {
+          0%   { background-position: -400px 0 }
+          100% { background-position:  400px 0 }
+        }
+        @keyframes gradientShift {
+          0%,100% { background-position: 0% 50% }
+          50%     { background-position: 100% 50% }
+        }
+        .msg-enter { animation: fadeSlideUp 0.3s ease both }
+        .font-display { font-family: var(--font-syne) }
+        .font-mono-dm { font-family: var(--font-dm-mono) }
 
-        <div className="space-y-6 flex-1">
-          <div className="space-y-4">
-            <h2 className="text-xs font-bold uppercase tracking-widest text-gray-500 flex items-center gap-2">
-              <Upload className="w-4 h-4" /> Data Source
-            </h2>
-            <div className="group">
-              <input
-                type="text"
-                placeholder="URL, or /path/to/dir..."
-                className="w-full px-4 py-3.5 bg-gray-950 border border-gray-800 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-transparent transition-all placeholder:text-gray-600 text-gray-300"
-                value={source}
-                onChange={(e) => setSource(e.target.value)}
-              />
+        /* Scrollbar */
+        .chat-scroll::-webkit-scrollbar { width: 4px }
+        .chat-scroll::-webkit-scrollbar-track { background: transparent }
+        .chat-scroll::-webkit-scrollbar-thumb { background: #ffffff0f; border-radius: 99px }
+        .chat-scroll::-webkit-scrollbar-thumb:hover { background: #ffffff1a }
+
+        /* Animated border on sidebar input focus */
+        .glow-input:focus { box-shadow: 0 0 0 2px #f59e0b33, 0 0 20px #f59e0b0d }
+
+        /* Prose overrides */
+        .rag-prose p  { margin:0 0 0.6em }
+        .rag-prose p:last-child { margin-bottom:0 }
+        .rag-prose code { font-family: var(--font-dm-mono); font-size:0.82em }
+        .rag-prose pre  { background:#0a0a0f; border:1px solid #ffffff0f; border-radius:10px; padding:1rem; overflow-x:auto }
+
+        /* Gradient header text */
+        .title-gradient {
+          background: linear-gradient(135deg, #fff 30%, #f59e0b 100%);
+          -webkit-background-clip: text;
+          -webkit-text-fill-color: transparent;
+          background-clip: text;
+        }
+      `}</style>
+
+      <div className="flex h-screen overflow-hidden" style={{ fontFamily: "var(--font-syne)" }}>
+
+        {/* ── Sidebar ─────────────────────────────────────────────────────── */}
+        <aside className="w-72 shrink-0 flex flex-col bg-[#0f0f16] border-r border-white/[0.05]">
+
+          {/* Logo */}
+          <div className="px-6 pt-7 pb-6 border-b border-white/[0.04]">
+            <div className="flex items-center gap-3">
+              <div className="relative w-9 h-9 rounded-xl bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center shadow-lg shadow-amber-500/25 shrink-0">
+                <Zap className="w-4.5 h-4.5 text-white" strokeWidth={2.5} />
+              </div>
+              <div>
+                <h1 className="font-display font-bold text-[15px] text-white title-gradient leading-none">
+                  RAG Engine
+                </h1>
+                <p className="text-[10px] font-mono-dm text-zinc-500 mt-0.5 tracking-widest uppercase">
+                  v2.0 · Modern Pipeline
+                </p>
+              </div>
             </div>
-            <button 
+          </div>
+
+          {/* Data source */}
+          <div className="px-5 py-6 border-b border-white/[0.04] space-y-3">
+            <label className="flex items-center gap-2 text-[9px] font-mono-dm uppercase tracking-[0.18em] text-zinc-500 mb-3">
+              <Upload className="w-3 h-3" />
+              Data Source
+            </label>
+
+            <input
+              type="text"
+              placeholder="URL or /path/to/dir"
+              className="glow-input w-full px-4 py-3 rounded-xl bg-[#0a0a0f] border border-white/[0.07] text-sm text-zinc-300 placeholder:text-zinc-600 focus:outline-none transition-all font-mono-dm"
+              style={{ fontFamily: "var(--font-dm-mono)", fontSize: "12px" }}
+              value={source}
+              onChange={e => setSource(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && handleLoadVectorStore()}
+            />
+
+            <button
               onClick={handleLoadVectorStore}
-              disabled={loading || !source}
-              className="w-full bg-white hover:bg-gray-100 disabled:bg-gray-800 disabled:text-gray-500 text-gray-900 font-semibold py-3.5 rounded-xl transition-all shadow-md active:scale-[0.98] flex justify-center border border-gray-200 disabled:border-transparent"
+              disabled={loading || !source.trim()}
+              className="w-full relative overflow-hidden rounded-xl py-3 text-sm font-display font-semibold tracking-wide transition-all
+                disabled:opacity-40 disabled:cursor-not-allowed
+                bg-gradient-to-r from-amber-400 to-orange-400 text-[#0a0a0f]
+                hover:from-amber-300 hover:to-orange-300 active:scale-[0.98]
+                shadow-lg shadow-amber-500/20"
             >
               {loading ? (
-                <span className="w-5 h-5 border-2 border-gray-900/30 border-t-gray-900 rounded-full animate-spin" />
-              ) : "Load & Index Data"}
+                <span className="flex items-center justify-center gap-2">
+                  <span className="w-4 h-4 border-2 border-[#0a0a0f]/30 border-t-[#0a0a0f] rounded-full animate-spin" />
+                  Indexing…
+                </span>
+              ) : indexSuccess ? (
+                <span className="flex items-center justify-center gap-2">✓ Indexed!</span>
+              ) : (
+                <span className="flex items-center justify-center gap-2">
+                  <Database className="w-3.5 h-3.5" /> Load & Index
+                </span>
+              )}
             </button>
           </div>
 
-          <div className="h-px w-full bg-gradient-to-r from-transparent via-gray-800 to-transparent my-8" />
-
-          <div className="space-y-4 bg-gray-950/50 p-5 rounded-2xl border border-gray-800/80 shadow-inner">
-            <h2 className="text-xs font-bold uppercase tracking-widest text-gray-500 flex items-center gap-2 mb-4">
-              <Activity className="w-3 h-3" /> Usage Stats
-            </h2>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="flex flex-col">
-                <span className="text-gray-500 text-xs font-semibold mb-1 flex items-center gap-1.5 uppercase tracking-widest"><FileText className="w-3 h-3"/> Queries</span>
-                <span className="text-2xl font-light text-white">{costQueries}</span>
-              </div>
-              <div className="flex flex-col">
-                <span className="text-gray-500 text-xs font-semibold mb-1 flex items-center gap-1.5 uppercase tracking-widest"><DollarSign className="w-3 h-3"/> Cost</span>
-                <span className="text-2xl font-light text-white">${costUsd.toFixed(4)}</span>
-              </div>
+          {/* Stats */}
+          <div className="px-5 py-5 border-b border-white/[0.04]">
+            <label className="flex items-center gap-2 text-[9px] font-mono-dm uppercase tracking-[0.18em] text-zinc-500 mb-3">
+              <Activity className="w-3 h-3" />
+              Session Stats
+            </label>
+            <div className="grid grid-cols-2 gap-2">
+              <StatBlock icon={FileText} label="Queries" value={String(costQueries)} />
+              <StatBlock icon={DollarSign} label="Cost" value={`$${costUsd.toFixed(4)}`} />
             </div>
           </div>
-        </div>
 
-        <button 
-          onClick={handleClearHistory}
-          className="mt-auto flex items-center justify-center gap-2 w-full py-3.5 px-4 bg-red-500/10 hover:bg-red-500/20 text-red-400 font-semibold rounded-xl transition-colors border border-red-500/20"
-        >
-          <Trash2 className="w-4 h-4" /> Clear History
-        </button>
-      </div>
+          {/* Spacer */}
+          <div className="flex-1" />
 
-      {/* Main Chat View */}
-      <div className="flex-1 flex flex-col bg-gray-950 relative overflow-hidden">
-        
-        {/* Chat History Flow */}
-        <div className="flex-1 overflow-y-auto px-4 md:px-8 lg:px-24 py-12 space-y-6 scroll-smooth z-10 custom-scrollbar">
-          {messages.length === 0 ? (
-            <div className="h-full flex flex-col items-center justify-center text-gray-500 space-y-6 animate-pulse">
-              <div className="w-20 h-20 rounded-2xl bg-gray-900 border border-gray-800 flex items-center justify-center shadow-2xl mb-4 text-4xl shadow-blue-500/5 hover:scale-105 transition-transform duration-500">🤖</div>
-              <h3 className="text-3xl font-light text-gray-400 tracking-tight">How can I help you today?</h3>
-              <p className="text-sm font-medium tracking-wide">Enter a document source in the sidebar to begin RAG processing.</p>
+          {/* Clear history */}
+          <div className="px-5 py-5">
+            <button
+              onClick={handleClearHistory}
+              className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-display font-semibold tracking-wide
+                text-red-400 border border-red-500/15 bg-red-500/[0.04]
+                hover:bg-red-500/10 hover:border-red-500/30 transition-all"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Clear History
+            </button>
+          </div>
+        </aside>
+
+        {/* ── Chat area ────────────────────────────────────────────────────── */}
+        <main className="flex-1 flex flex-col overflow-hidden bg-[#0a0a0f]">
+
+          {/* Top bar */}
+          <header className="shrink-0 flex items-center justify-between px-8 py-4 border-b border-white/[0.04]">
+            <div className="flex items-center gap-2.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-lg shadow-emerald-400/50" />
+              <span className="text-xs font-mono-dm text-zinc-500 tracking-widest uppercase">
+                {chatting ? "Processing…" : "Ready"}
+              </span>
             </div>
-          ) : (
-            messages.map((msg) => (
-              <div key={msg.id} className={`flex w-full ${msg.role === 'human' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-[85%] md:max-w-[75%] rounded-3xl px-7 py-5 shadow-sm text-[15px] leading-relaxed
-                  ${msg.role === 'human' 
-                    ? 'bg-blue-600 text-white rounded-br-sm' 
-                    : 'bg-gray-900 text-gray-300 rounded-bl-sm border border-gray-800'
-                  }`}>
-                  <div className={`prose ${msg.role === 'human' ? 'prose-invert prose-p:text-white prose-a:text-blue-200' : 'prose-invert prose-p:text-gray-300 prose-strong:text-gray-100 prose-a:text-blue-400 prose-code:text-emerald-400 '} max-w-none break-words`}>
-                    <ReactMarkdown>
-                      {msg.content}
-                    </ReactMarkdown>
-                  </div>
+            <span className="text-[10px] font-mono-dm text-zinc-700 tracking-wide">
+              {messages.filter(m => m.role === "human").length} messages
+            </span>
+          </header>
+
+          {/* Messages */}
+          <div className="chat-scroll flex-1 overflow-y-auto px-6 md:px-16 lg:px-24 py-8 space-y-6">
+            {messages.length === 0 ? (
+
+              /* ── Empty state ── */
+              <div className="h-full min-h-[60vh] flex flex-col items-center justify-center select-none">
+                <div
+                  className="w-16 h-16 rounded-2xl mb-6 flex items-center justify-center
+                    bg-gradient-to-br from-amber-400/20 to-orange-500/10
+                    border border-amber-400/20 shadow-2xl shadow-amber-500/10"
+                >
+                  <Zap className="w-7 h-7 text-amber-400" />
+                </div>
+                <h2 className="font-display font-bold text-2xl text-white/80 mb-2 tracking-tight">
+                  Ask your documents
+                </h2>
+                <p className="text-sm text-zinc-500 text-center max-w-sm leading-relaxed">
+                  Load a document source in the sidebar, then ask anything.
+                  The RAG pipeline will retrieve and synthesise an answer.
+                </p>
+                <div className="mt-8 flex flex-wrap items-center justify-center gap-2">
+                  {["What is this document about?", "Summarise key points", "Find relevant sections"].map(q => (
+                    <button
+                      key={q}
+                      onClick={() => setInput(q)}
+                      className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-white/[0.03] border border-white/[0.06]
+                        text-xs text-zinc-400 hover:text-white hover:border-amber-400/30 hover:bg-amber-400/[0.05] transition-all"
+                    >
+                      <ChevronRight className="w-3 h-3 text-amber-400" />
+                      {q}
+                    </button>
+                  ))}
                 </div>
               </div>
-            ))
-          )}
-          <div ref={messagesEndRef} className="h-8" />
-        </div>
 
-        {/* Input Text Box */}
-        <div className="p-6 bg-gradient-to-t from-gray-950 via-gray-950 to-transparent z-20 w-full">
-          <div className="max-w-4xl mx-auto">
-            <form onSubmit={handleSendMessage} className="relative group">
+            ) : messages.map((msg, idx) => (
+
+              /* ── Message bubble ── */
+              <div
+                key={msg.id}
+                className={`msg-enter flex w-full gap-3 ${msg.role === "human" ? "justify-end" : "justify-start"}`}
+                style={{ animationDelay: `${idx < 3 ? 0 : 0}ms` }}
+              >
+                {/* Avatar — assistant */}
+                {msg.role === "assistant" && (
+                  <div className="shrink-0 w-7 h-7 mt-1 rounded-lg bg-gradient-to-br from-amber-400 to-orange-500
+                    flex items-center justify-center shadow-md shadow-amber-500/20">
+                    <Zap className="w-3.5 h-3.5 text-[#0a0a0f]" strokeWidth={2.5} />
+                  </div>
+                )}
+
+                <div className={`flex flex-col gap-1.5 max-w-[78%]`}>
+                  {/* Sources row */}
+                  {msg.role === "assistant" && msg.sources && msg.sources.length > 0 && (
+                    <div className="flex flex-wrap px-1">
+                      {msg.sources.map(s => <SourceChip key={s} label={s} />)}
+                    </div>
+                  )}
+
+                  {/* Bubble */}
+                  <div
+                    className={`rounded-2xl px-5 py-4 text-sm leading-relaxed
+                      ${msg.role === "human"
+                        ? "bg-white/[0.06] border border-white/[0.08] text-zinc-100 rounded-tr-sm"
+                        : "bg-[#0f0f16] border border-white/[0.06] text-zinc-300 rounded-tl-sm"
+                      }`}
+                  >
+                    <div className="rag-prose">
+                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      {streamingId === msg.id && msg.content !== "" && <TypingCursor />}
+                    </div>
+
+                    {/* Streaming skeleton when content is empty */}
+                    {streamingId === msg.id && msg.content === "" && (
+                      <div className="space-y-2 py-1">
+                        {[80, 65, 40].map((w, i) => (
+                          <div
+                            key={i}
+                            className="h-3 rounded-full bg-gradient-to-r from-white/[0.04] via-white/[0.09] to-white/[0.04]"
+                            style={{
+                              width: `${w}%`,
+                              backgroundSize: "400px 100%",
+                              animation: `shimmer 1.4s infinite linear`,
+                              animationDelay: `${i * 0.15}s`,
+                            }}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Avatar — human */}
+                {msg.role === "human" && (
+                  <div className="shrink-0 w-7 h-7 mt-1 rounded-lg bg-zinc-700/60 border border-white/[0.08]
+                    flex items-center justify-center text-[10px] font-display font-bold text-zinc-300">
+                    U
+                  </div>
+                )}
+              </div>
+            ))}
+
+            <div ref={messagesEndRef} className="h-4" />
+          </div>
+
+          {/* ── Input bar ────────────────────────────────────────────────── */}
+          <div className="shrink-0 px-6 md:px-16 lg:px-24 py-5 border-t border-white/[0.04]">
+            <form onSubmit={handleSendMessage} className="relative max-w-3xl mx-auto">
               <input
+                ref={inputRef}
                 type="text"
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder="Ask your assistant anything..."
-                className="w-full bg-gray-900 border border-gray-800 focus:border-blue-600 focus:bg-gray-900/80 rounded-2xl pl-6 pr-16 py-4 focus:outline-none focus:ring-4 focus:ring-blue-600/10 text-gray-100 placeholder-gray-500 transition-all shadow-xl"
+                onChange={e => setInput(e.target.value)}
+                placeholder="Ask anything about your documents…"
                 disabled={chatting}
+                className="w-full rounded-xl pl-5 pr-14 py-4 text-sm
+                  bg-[#0f0f16] border border-white/[0.08] text-zinc-100
+                  placeholder:text-zinc-600 font-mono-dm
+                  focus:outline-none focus:border-amber-400/40 focus:shadow-[0_0_0_3px_#f59e0b14]
+                  disabled:opacity-50 transition-all"
+                style={{ fontFamily: "var(--font-dm-mono)", fontSize: "13px" }}
               />
               <button
                 type="submit"
                 disabled={!input.trim() || chatting}
-                className="absolute right-3 top-2.5 p-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white rounded-xl transition-all active:scale-[0.97] disabled:scale-100 disabled:opacity-50"
+                className="absolute right-2.5 top-2.5 w-9 h-9 rounded-lg
+                  bg-gradient-to-br from-amber-400 to-orange-400
+                  flex items-center justify-center
+                  disabled:opacity-30 disabled:cursor-not-allowed
+                  hover:from-amber-300 hover:to-orange-300
+                  active:scale-95 transition-all shadow-md shadow-amber-500/20"
               >
-                {chatting ? <span className="w-5 h-5 block border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Send className="w-5 h-5 ml-0.5" />}
+                {chatting
+                  ? <span className="w-4 h-4 border-2 border-[#0a0a0f]/30 border-t-[#0a0a0f] rounded-full animate-spin" />
+                  : <Send className="w-4 h-4 text-[#0a0a0f]" strokeWidth={2.5} />
+                }
               </button>
             </form>
-            <div className="text-center mt-4 text-[11px] font-medium tracking-wide text-gray-600 uppercase">
-              RAG Engine uses locally executed chunking. Responses are machine generated.
-            </div>
+            <p className="text-center mt-3 text-[10px] font-mono-dm tracking-widest uppercase text-zinc-700">
+              Responses are machine-generated · RAG Engine 2.0
+            </p>
           </div>
-        </div>
+        </main>
       </div>
-    </div>
+    </>
   );
 }
