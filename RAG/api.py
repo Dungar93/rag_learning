@@ -39,8 +39,7 @@ class LoadRequest(BaseModel):
 
 history = ChatHistory(CONFIG["history_file"])
 tracker = CostTracker()
-vs = load_vectorstore()
-retriever = build_retriever(vs) if vs else None
+retriever = None
 
 @app.post("/api/vectorstore/build")
 async def build_vectorstore_route(req: LoadRequest):
