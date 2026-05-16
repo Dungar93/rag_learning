@@ -7,7 +7,7 @@ langchain_openai==1.2.1
 langchain_text_splitters==1.1.2
 pydantic==2.13.4
 python-dotenv==1.2.2
-sentence_transformers==5.5.0
+chromadb
 openai
 tiktoken
 numpy
