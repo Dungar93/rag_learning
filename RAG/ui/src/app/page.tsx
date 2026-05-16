@@ -64,7 +64,7 @@ export default function Home() {
 
   // ── Load history on mount ──
   useEffect(() => {
-    fetch("http://localhost:8000/api/history")
+    fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/history`)
       .then(r => r.json())
       .then(data => {
         if (data.messages) {
@@ -92,7 +92,7 @@ export default function Home() {
     setLoading(true);
     setIndexSuccess(false);
     try {
-      const res = await fetch("http://localhost:8000/api/vectorstore/build", {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/vectorstore/build`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source }),
@@ -113,7 +113,7 @@ export default function Home() {
   // ── Clear history ──
   const handleClearHistory = async () => {
     try {
-      await fetch("http://localhost:8000/api/history", { method: "DELETE" });
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/history`, { method: "DELETE" });
       setMessages([]);
     } catch (e) {
       console.error(e);
@@ -136,7 +136,7 @@ export default function Home() {
     setStreamingId(botMsgId);
 
     try {
-      const response = await fetch("http://localhost:8000/api/chat", {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: userMsg }),
